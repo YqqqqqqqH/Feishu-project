@@ -29,10 +29,12 @@
 ### M1 飞书接入层 — 已完成基础功能
 - [x] Flask 回调接口 + 飞书 URL 验证
 - [x] Cloudflare 隧道打通公网访问（`cloudflared tunnel --url http://localhost:5000`）
-- [x] 飞书事件消息解析（从嵌套结构中提取文本）
+- [x] 飞书事件消息解析（从嵌套结构中提取文本 + chat_id）
 - [x] 消息去重（message_id）
 - [x] 任务提取：关键词触发 + 正则提取商品名和好评率阈值
-- [ ] Bot Token 管理与消息回传（M1 出口部分）
+- [x] Bot Token 管理（自动获取 + 缓存 + 过期刷新）
+- [x] 消息回传（send_feishu_message，文本消息）
+- [ ] 卡片消息回传（结构化报告，M4 完成后对接）
 
 ### M2 Agent 调度层 — 待开发
 ### M3 浏览器自动化层 — 待开发
