@@ -6,8 +6,8 @@
 1. 飞书接收测试任务指令
 2. 浏览器自动化访问淘宝（https://www.taobao.com/）
 3. 完成淘宝账号登录
-4. 搜索关键词"索尼耳机"
-5. 筛选好评率 ≥ 99% 的商品
+4. 搜索关键词（由用户消息动态指定，不局限于"索尼耳机"）
+5. 筛选好评率 ≥ 阈值的商品（默认 99%，用户可指定）
 6. 将符合条件的商品加入购物车
 7. 将测试结果回传飞书
 
@@ -24,15 +24,40 @@
 - Skill 必须符合 openclaw 规范
 - 飞书作为任务入口和结果出口
 
-## 工作目录结构（规划）
+## 当前进度
+
+### M1 飞书接入层 — 已完成基础功能
+- [x] Flask 回调接口 + 飞书 URL 验证
+- [x] Cloudflare 隧道打通公网访问（`cloudflared tunnel --url http://localhost:5000`）
+- [x] 飞书事件消息解析（从嵌套结构中提取文本）
+- [x] 消息去重（message_id）
+- [x] 任务提取：关键词触发 + 正则提取商品名和好评率阈值
+- [ ] Bot Token 管理与消息回传（M1 出口部分）
+
+### M2 Agent 调度层 — 待开发
+### M3 浏览器自动化层 — 待开发
+### M4 数据处理层 — 待开发
+### M5 Skill 定义层 — 待开发
+
+## 基础设施
+
+- 本地开发端口：5000
+- 公网隧道：cloudflared（开发阶段），后续考虑 VPS
+- 回调接口文件：`test.py`
+
+## 工作目录结构
 
 ```
 feishu_project/
 ├── CLAUDE.md          # 本文件
 ├── handout.md         # 原始需求
-├── DESIGN.md          # 技术设计文档（主交付物）
-├── SKILL.md           # Skill 定义文件
-└── src/               # 核心代码示例
+├── modules.md         # 模块拆分与开放问题
+├── brainstorm.txt     # 头脑风暴笔记
+├── parse.txt          # M1 解析思路笔记
+├── test.py            # 飞书回调接口（当前开发入口）
+├── DESIGN.md          # 技术设计文档（主交付物，待编写）
+├── SKILL.md           # Skill 定义文件（待编写）
+└── src/               # 核心代码示例（待编写）
     ├── skill.py       # Skill 入口
     ├── browser.py     # 浏览器自动化模块
     └── feishu.py      # 飞书消息收发模块
@@ -44,3 +69,4 @@ feishu_project/
 - `SKILL.md` 按 openclaw Skill 规范编写
 - 代码示例用 Python + Playwright（或 Selenium），保持最小可运行
 - 不要过度设计，聚焦需求文档要求的场景
+- 消息解析采用关键词触发 + 商品信息提取的混合策略

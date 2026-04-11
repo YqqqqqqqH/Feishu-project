@@ -1,0 +1,5 @@
+对于modules.md中第一个模块中的思考：
+M1:对于用关键词还是LLM语义解析，首先触发agent skill常用的用户关键词是：“买”，“想买”，“推荐”，消息中包含商品信息，两者相结合才能get到用户想要打开淘宝的需求。
+我之前没有参与过公网部署项目的开发，我刚才在ubuntu中安装成功了cloudflare，并尝试建立了临时隧道：cloudflared tunnel --url http://localhost:5000
+feushu通过https://dance-impose-elephant-conclude.trycloudflare.com访问本地；另外接口文件是test.py;由于目前处于开发调试阶段，所以先尝试使用cloudflared，后续再考虑VPS服务。
+目前已打通隧道和相应接口，根据以上推进项目进度。
