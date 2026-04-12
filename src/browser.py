@@ -46,14 +46,19 @@ async def wait_for_manual_login(page, timeout=120):
     print(f"[登录] 请在 {timeout} 秒内完成淘宝登录...")
     await page.goto("https://login.taobao.com/", wait_until="domcontentloaded")
 
-    # 等待跳转回淘宝首页（登录成功后会自动跳转）
-    try:
-        await page.wait_for_url("**/www.taobao.com/**", timeout=timeout * 1000)
-        print("[登录] 登录成功")
-        return True
-    except Exception:
-        print("[登录] 登录超时")
-        return False
+    # 扫码后可能跳转到多种页面：www.taobao.com、i.taobao.com、login中间页等
+    # 改用轮询检测：只要 URL 离开了 login.taobao.com 就算登录成功
+    import time
+    start = time.time()
+    while time.time() - start < timeout:
+        url = page.url
+        if "login.taobao.com" not in url:
+            print(f"[登录] 登录成功，跳转到: {url}")
+            return True
+        await page.wait_for_timeout(1000)
+
+    print("[登录] 登录超时")
+    return False
 
 
 async def save_session(context):
@@ -73,9 +78,8 @@ async def search_products(page, keyword):
     search_input = await page.wait_for_selector('#q', timeout=10000)
     await search_input.fill(keyword)
 
-    # 点击搜索按钮
-    search_btn = await page.wait_for_selector('button.btn-search, .search-button', timeout=5000)
-    await search_btn.click()
+    # 按回车触发搜索（比点击按钮更可靠，避免按钮不可见/被遮挡）
+    await search_input.press('Enter')
 
     # 等待商品列表渲染（淘宝动态加载）
     await page.wait_for_selector('.Content--contentInner--QVTcU0M, .search-content', timeout=15000)
@@ -201,7 +205,7 @@ async def rank_and_filter(page, items, threshold=99, max_results=5):
     """
     print(f"[筛选] 开始获取好评率，共 {len(items)} 个商品...")
 
-    # 限制详情页访问数量，避免触发反爬（最多查 10 个）
+    # 限制详情页访问数量，避免触发反爬（最多查 10 个）//是否有缺点
     candidates = items[:10]
 
     for item in candidates:

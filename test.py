@@ -2,8 +2,14 @@ import json
 import os
 import re
 import time
+import asyncio
+import threading
 import requests
 from flask import Flask, request, jsonify
+
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+from browser import run_task
 
 app = Flask(__name__)
 
@@ -119,8 +125,9 @@ def extract_task(text):
             threshold = val
 
     # 移除触发词和阈值描述，剩余部分作为商品关键词
+    # 按长度降序排列，优先匹配长词（"想买"先于"买"），避免残留
     keyword = text
-    for kw in TRIGGER_KEYWORDS:
+    for kw in sorted(TRIGGER_KEYWORDS, key=len, reverse=True):
         keyword = keyword.replace(kw, "")
     # 移除常见修饰语
     keyword = re.sub(r"(一款|一个|好评[率高]*的?|以上|\d{2,3}[%分]|帮我)", "", keyword)
@@ -164,11 +171,31 @@ def callback():
             msg["chat_id"],
             f"收到！正在为你搜索「{task['keyword']}」，好评率 ≥ {task['rating_threshold']}%，请稍候..."
         )
-        # TODO: 调用 M2 调度层，启动浏览器自动化流程
+        # 在后台线程中启动浏览器自动化，避免阻塞飞书回调
+        threading.Thread(
+            target=_run_browser_task,
+            args=(task["keyword"], task["rating_threshold"], msg["chat_id"]),
+            daemon=True,
+        ).start()
     else:
         print(f"[忽略消息] 未识别为购物任务: {msg['text']}")
 
     return jsonify({})
+
+
+def _run_browser_task(keyword, threshold, chat_id):
+    """后台执行浏览器自动化任务，完成后回传飞书。"""
+    result = asyncio.run(run_task(keyword, rating_threshold=threshold))
+
+    if result["status"] == "success":
+        lines = [f"搜索「{keyword}」完成，共抓取 {result['total_scraped']} 个商品，筛选结果：\n"]
+        for i, item in enumerate(result["items"], 1):
+            rating_str = f"{item['rating']}%" if item["rating"] else "未获取"
+            cart_str = "已加购" if item.get("added_to_cart") else "加购失败"
+            lines.append(f"{i}. {item['title']}\n   价格: ¥{item['price']} | 好评率: {rating_str} | {cart_str}")
+        send_feishu_message(chat_id, "\n".join(lines))
+    else:
+        send_feishu_message(chat_id, f"任务失败：{result.get('message', '未知错误')}")
 
 
 if __name__ == '__main__':
