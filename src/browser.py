@@ -3,6 +3,8 @@
 import asyncio
 import json
 import os
+import re
+import time
 from pathlib import Path
 from playwright.async_api import async_playwright
 
@@ -48,7 +50,6 @@ async def wait_for_manual_login(page, timeout=120):
 
     # 扫码后可能跳转到多种页面：www.taobao.com、i.taobao.com、login中间页等
     # 改用轮询检测：只要 URL 离开了 login.taobao.com 就算登录成功
-    import time
     start = time.time()
     while time.time() - start < timeout:
         url = page.url
@@ -72,17 +73,29 @@ async def search_products(page, keyword):
     """在淘宝搜索关键词，等待商品列表加载。"""
     print(f"[搜索] 关键词: {keyword}")
     await page.goto("https://www.taobao.com/", wait_until="domcontentloaded")
-    await page.wait_for_timeout(1000)
+    await page.wait_for_timeout(2000)
 
-    # 定位搜索框并输入
-    search_input = await page.wait_for_selector('#q', timeout=10000)
+    # 定位搜索框并输入（#q 是淘宝搜索框的稳定 id）
+    # 备选：用 placeholder 属性定位
+    search_input = await page.query_selector('#q')
+    if not search_input:
+        search_input = await page.query_selector('input[placeholder*="搜索"]')
+    if not search_input:
+        search_input = await page.wait_for_selector('input[type="text"]', timeout=10000)
+
+    await search_input.click()
     await search_input.fill(keyword)
+    await page.wait_for_timeout(500)
 
-    # 按回车触发搜索（比点击按钮更可靠，避免按钮不可见/被遮挡）
+    # 按回车触发搜索
     await search_input.press('Enter')
 
-    # 等待商品列表渲染（淘宝动态加载）
-    await page.wait_for_selector('.Content--contentInner--QVTcU0M, .search-content', timeout=15000)
+    # 等待搜索结果页加载 — 用属性前缀匹配，不依赖哈希后缀
+    # 淘宝搜索结果容器的 class 通常包含 "contentInner" 或 "Content"
+    await page.wait_for_selector(
+        '[class*="contentInner"], [class*="search-content"], [class*="shoplist"]',
+        timeout=20000,
+    )
     await page.wait_for_timeout(2000)
     print("[搜索] 商品列表已加载")
 
@@ -92,15 +105,20 @@ async def scrape_product_list(page):
     items = []
 
     # 滚动页面触发懒加载
-    for _ in range(3):
-        await page.evaluate("window.scrollBy(0, 800)")
-        await page.wait_for_timeout(1000)
+    for _ in range(5):
+        await page.evaluate("window.scrollBy(0, 600)")
+        await page.wait_for_timeout(800)
 
-    # 淘宝商品卡片选择器（可能随页面更新变化）
-    cards = await page.query_selector_all('.Content--contentInner--QVTcU0M .Card--doubleCardWrapper--L2XFE73, [data-widgetid] .doubleCardWrapper')
+    # 用属性前缀匹配商品卡片，不依赖哈希后缀
+    # 淘宝卡片 class 通常包含 "doubleCardWrapper" 或 "CardWrapper"
+    cards = await page.query_selector_all('[class*="doubleCardWrapper"]')
     if not cards:
-        # 备选选择器
-        cards = await page.query_selector_all('.items .item, .search-content .item')
+        cards = await page.query_selector_all('[class*="CardWrapper"]')
+    if not cards:
+        cards = await page.query_selector_all('[class*="card--"] a[href*="item"]')
+    if not cards:
+        # 最后兜底：搜索结果区域内所有包含商品链接的块
+        cards = await page.query_selector_all('.search-content .item, [class*="shoplist"] .item')
 
     print(f"[抓取] 找到 {len(cards)} 个商品卡片")
 
@@ -118,24 +136,26 @@ async def scrape_product_list(page):
 
 async def _extract_card_info(card):
     """从单个商品卡片中提取信息。"""
-    # 商品名称
-    title_el = await card.query_selector('.Title--title--jCOPvpf, .title, a[href*=\"detail.tmall\"], a[href*=\"item.taobao\"]')
+    # 商品名称 — 用属性前缀匹配，兼容哈希变化
+    title_el = await card.query_selector('[class*="title--"], [class*="Title--title"], .title')
+    if not title_el:
+        title_el = await card.query_selector('a[href*="detail.tmall"], a[href*="item.taobao"]')
     title = await title_el.inner_text() if title_el else ""
     title = title.strip()
     if not title:
         return None
 
     # 价格
-    price_el = await card.query_selector('.Price--priceInt--ZlsSi_M, .price, .priceInt')
+    price_el = await card.query_selector('[class*="priceInt"], [class*="Price--price"], .price')
     price_text = await price_el.inner_text() if price_el else "0"
     price = price_text.strip().replace("¥", "").replace(",", "")
 
     # 销量
-    sales_el = await card.query_selector('.Price--realSales--FhTZc7U, .deal-cnt, .realSales')
+    sales_el = await card.query_selector('[class*="realSales"], [class*="Sales--"], .deal-cnt')
     sales_text = await sales_el.inner_text() if sales_el else ""
 
     # 店铺名
-    shop_el = await card.query_selector('.ShopInfo--TextAndPic--yH0AZfx, .shop, .shopname')
+    shop_el = await card.query_selector('[class*="ShopInfo"], [class*="shopName"], .shop, .shopname')
     shop = await shop_el.inner_text() if shop_el else ""
 
     # 商品链接
@@ -150,15 +170,12 @@ async def _extract_card_info(card):
         "sales": sales_text.strip(),
         "shop": shop.strip(),
         "url": link,
-        "rating": None,  # 好评率需要进入详情页获取
+        "rating": None,
     }
 
 
 async def fetch_rating(page, product_url):
-    """进入商品详情页获取好评率。
-
-    淘宝列表页通常不直接显示好评率，需要进入详情页抓取。
-    """
+    """进入商品详情页获取好评率。"""
     try:
         detail_page = await page.context.new_page()
         await detail_page.goto(product_url, wait_until="domcontentloaded", timeout=15000)
@@ -166,25 +183,23 @@ async def fetch_rating(page, product_url):
 
         # 尝试多种选择器定位好评率
         rating_selectors = [
-            '.tb-rate-counter .rate-percent',
             '[class*="ratePercent"]',
             '[class*="goodRate"]',
+            '[class*="rate-percent"]',
+            '.tb-rate-counter .rate-percent',
             '.tm-rate .percent',
         ]
         for sel in rating_selectors:
             el = await detail_page.query_selector(sel)
             if el:
                 text = await el.inner_text()
-                # 提取数字，如 "99.2%" -> 99.2
-                import re
                 match = re.search(r'(\d+\.?\d*)', text)
                 if match:
                     await detail_page.close()
                     return float(match.group(1))
 
-        # 备选：从页面文本中正则匹配好评率
+        # 备选：从页面全文正则匹配好评率
         body_text = await detail_page.inner_text('body')
-        import re
         match = re.search(r'好评[率度]\s*[：:]\s*(\d+\.?\d*)%?', body_text)
         if match:
             await detail_page.close()
@@ -205,7 +220,7 @@ async def rank_and_filter(page, items, threshold=99, max_results=5):
     """
     print(f"[筛选] 开始获取好评率，共 {len(items)} 个商品...")
 
-    # 限制详情页访问数量，避免触发反爬（最多查 10 个）//是否有缺点
+    # 限制详情页访问数量，避免触发反爬（最多查 10 个）
     candidates = items[:10]
 
     for item in candidates:
@@ -246,7 +261,9 @@ async def add_to_cart(page, product_url):
             'button:has-text("加入购物车")',
             'a:has-text("加入购物车")',
             '[class*="addCart"]',
+            '[class*="AddCart"]',
             '[data-spm*="addcart"]',
+            'button:has-text("加购")',
         ]
         for sel in cart_selectors:
             btn = await page.query_selector(sel)
