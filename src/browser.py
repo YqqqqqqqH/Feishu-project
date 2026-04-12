@@ -70,34 +70,86 @@ async def save_session(context):
 
 
 async def search_products(page, keyword):
-    """在淘宝搜索关键词，等待商品列表加载。"""
+    """在淘宝搜索关键词，等待商品列表加载。
+
+    关键：通过首页搜索框交互而非直接 URL 跳转，避免触发淘宝反爬虫机制。
+    """
     print(f"[搜索] 关键词: {keyword}")
+
+    # 导航到淘宝首页
+    print(f"[搜索] 导航到淘宝首页...")
     await page.goto("https://www.taobao.com/", wait_until="domcontentloaded")
     await page.wait_for_timeout(2000)
 
-    # 定位搜索框并输入（#q 是淘宝搜索框的稳定 id）
-    # 备选：用 placeholder 属性定位
-    search_input = await page.query_selector('#q')
-    if not search_input:
-        search_input = await page.query_selector('input[placeholder*="搜索"]')
-    if not search_input:
-        search_input = await page.wait_for_selector('input[type="text"]', timeout=10000)
+    # 定位搜索框
+    print(f"[搜索] 定位搜索框...")
+    search_input = None
+    search_selectors = [
+        'input#q',
+        'input[id="q"]',
+        'input[placeholder*="搜索"]',
+        'input[name="q"]',
+    ]
 
+    for sel in search_selectors:
+        try:
+            search_input = await page.query_selector(sel)
+            if search_input:
+                print(f"[搜索] 找到搜索框: {sel}")
+                break
+        except:
+            pass
+
+    if not search_input:
+        print(f"[搜索] 未找到搜索框，尝试等待...")
+        search_input = await page.wait_for_selector('input[type="text"], input[type="search"]', timeout=10000)
+
+    # 填充搜索框
+    print(f"[搜索] 填充关键词: {keyword}")
     await search_input.click()
+    await page.wait_for_timeout(500)
+    await search_input.evaluate("el => el.value = ''")
     await search_input.fill(keyword)
     await page.wait_for_timeout(500)
 
     # 按回车触发搜索
-    await search_input.press('Enter')
+    print(f"[搜索] 发送回车键...")
 
-    # 等待搜索结果页加载 — 用属性前缀匹配，不依赖哈希后缀
-    # 淘宝搜索结果容器的 class 通常包含 "contentInner" 或 "Content"
-    await page.wait_for_selector(
-        '[class*="contentInner"], [class*="search-content"], [class*="shoplist"]',
-        timeout=20000,
-    )
+    # 监听导航（等待 URL 变化）
+    try:
+        await asyncio.gather(
+            search_input.press('Enter'),
+            page.wait_for_load_state('networkidle', timeout=25000),
+        )
+        print(f"[搜索] 导航完成")
+    except Exception as e:
+        print(f"[搜索] 导航异常: {e}")
+
+    # 等待一下，让页面完全渲染
+    await page.wait_for_timeout(3000)
+    current_url = page.url
+    print(f"[诊断] 导航后 URL: {current_url}")
+
+    # 等待网络空闲
+    print(f"[搜索] 等待页面完全加载...")
+    try:
+        await page.wait_for_load_state('networkidle', timeout=20000)
+    except:
+        print(f"[搜索] 网络空闲等待超时，继续处理...")
+
+    # 最后的稳定等待
     await page.wait_for_timeout(2000)
-    print("[搜索] 商品列表已加载")
+
+    # 诊断
+    current_url = page.url
+    print(f"[诊断] 最终 URL: {current_url}")
+
+    if 'error' in current_url:
+        print(f"[错误] 淘宝返回错误页面，可能被反爬虫拦截")
+        print(f"[建议] 请检查会话是否过期，或尝试手动登录")
+        # 继续执行，让后续流程处理
+    else:
+        print(f"[搜索] ✓ 搜索完成")
 
 
 async def scrape_product_list(page):
@@ -105,22 +157,75 @@ async def scrape_product_list(page):
     items = []
 
     # 滚动页面触发懒加载
-    for _ in range(5):
+    for i in range(5):
         await page.evaluate("window.scrollBy(0, 600)")
         await page.wait_for_timeout(800)
+        print(f"[抓取] 滚动 {i+1}/5")
 
-    # 用属性前缀匹配商品卡片，不依赖哈希后缀
-    # 淘宝卡片 class 通常包含 "doubleCardWrapper" 或 "CardWrapper"
-    cards = await page.query_selector_all('[class*="doubleCardWrapper"]')
-    if not cards:
-        cards = await page.query_selector_all('[class*="CardWrapper"]')
-    if not cards:
-        cards = await page.query_selector_all('[class*="card--"] a[href*="item"]')
-    if not cards:
-        # 最后兜底：搜索结果区域内所有包含商品链接的块
-        cards = await page.query_selector_all('.search-content .item, [class*="shoplist"] .item')
+    # 关键：直接用 XPath 或链接查找商品
+    # 淘宝商品链接通常是 a 标签，href 包含 item.taobao.com 或 detail.tmall.com
+    print(f"[抓取] 查找商品链接...")
+    links = await page.query_selector_all('a[href*="item.taobao.com"], a[href*="detail.tmall.com"]')
+    print(f"[抓取] 找到 {len(links)} 个商品链接")
 
-    print(f"[抓取] 找到 {len(cards)} 个商品卡片")
+    if not links:
+        print(f"[诊断] 未找到商品链接，尝试备选方案...")
+        # 备选：查找所有可能的商品容器
+        divs = await page.query_selector_all('div[class*="card"], div[class*="item"], div[class*="product"]')
+        print(f"[诊断] 找到 {len(divs)} 个可能的卡片容器")
+        return items
+
+    # 从链接元素中提取商品信息
+    for link in links[:10]:  # 限制处理前 10 个
+        try:
+            href = await link.get_attribute("href")
+            if not href:
+                continue
+
+            # 提取商品标题
+            title = await link.inner_text()
+            title = title.strip()
+            if not title or len(title) < 2:
+                continue
+
+            # 构建绝对 URL
+            if href.startswith('//'):
+                href = 'https:' + href
+            elif href.startswith('/'):
+                href = 'https://taobao.com' + href
+
+            # 尝试找价格和店铺信息（这些通常在链接的兄弟或父元素中）
+            parent = await link.evaluate_handle("el => el.closest('[class*=\"card\"], [class*=\"item\"], [class*=\"product\"], .tbp-item, .shop-item')")
+            if parent:
+                try:
+                    # 查找价格
+                    price_el = await parent.evaluate("el => el.querySelector('[class*=\"price\"], [class*=\"Price\"]')")
+                    if price_el:
+                        price_text = await price_el.inner_text()
+                        price = price_text.replace('¥', '').strip()
+                    else:
+                        price = '0'
+                except:
+                    price = '0'
+            else:
+                price = '0'
+
+            item = {
+                "title": title,
+                "price": price,
+                "sales": "",
+                "shop": "",
+                "url": href,
+                "rating": None,
+            }
+            items.append(item)
+            print(f"[抓取] ✓ {title[:30]}... ¥{price}")
+        except Exception as e:
+            print(f"[抓取] 单个商品解析失败: {e}")
+            continue
+
+    print(f"[抓取] 成功抓取 {len(items)} 个商品")
+    return items
 
     for card in cards:
         try:
