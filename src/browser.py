@@ -3,38 +3,106 @@
 import asyncio
 import json
 import os
+import random
 import re
 import time
 from pathlib import Path
 from playwright.async_api import async_playwright
+from playwright_stealth import Stealth
 
-# session 持久化目录
+# stealth 实例（全局复用）
+_stealth = Stealth()
+
+# ── 路径配置 ──────────────────────────────────────────────
+# user-data-dir：复用本地 Chrome 的完整用户数据（cookie、登录态、指纹）
+# 比 storage_state 更彻底，淘宝风控更难识别
+USER_DATA_DIR = Path(__file__).parent.parent / ".chrome_profile"
+
+# 旧版 session 文件（仅作为 cookie 注入的备选来源）
 SESSION_DIR = Path(__file__).parent.parent / ".session"
 SESSION_FILE = SESSION_DIR / "taobao_state.json"
 
+# 本地正式版 Chrome / Chromium 路径（避免 Playwright 自带的测试版浏览器）
+_CHROME_CANDIDATES = [
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+]
+
+
+def _find_chrome():
+    """查找本地安装的正式版 Chrome。"""
+    for path in _CHROME_CANDIDATES:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+async def _human_delay(lo=0.3, hi=1.5):
+    """随机延迟，模拟人类操作节奏。"""
+    await asyncio.sleep(random.uniform(lo, hi))
+
 
 async def launch_browser():
-    """启动浏览器，优先加载已保存的 session。"""
+    """启动浏览器（反风控增强版）。
+
+    策略：
+    1. stealth 插件 — 隐藏 Playwright 自动化特征
+    2. 本地正式版 Chrome — 避免被识别为测试浏览器
+    3. user-data-dir — 复用完整用户数据（cookie、登录态）
+    4. cookie 注入 — 若 user-data-dir 无登录态，从旧 session 文件注入
+    """
     pw = await async_playwright().start()
-    browser = await pw.chromium.launch(headless=False)
 
-    if SESSION_FILE.exists():
-        context = await browser.new_context(storage_state=str(SESSION_FILE))
-        print("[浏览器] 已加载保存的 session")
+    chrome_path = _find_chrome()
+    USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 使用 launch_persistent_context：绑定 user-data-dir，复用登录态
+    # 指定本地正式版 Chrome，避免 Playwright 自带的 Chromium 测试版
+    launch_args = {
+        "headless": False,
+        "user_data_dir": str(USER_DATA_DIR),
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ],
+    }
+    if chrome_path:
+        launch_args["executable_path"] = chrome_path
+        print(f"[浏览器] 使用本地 Chrome: {chrome_path}")
     else:
-        context = await browser.new_context()
-        print("[浏览器] 使用全新 session")
+        print("[浏览器] 未找到本地 Chrome，使用 Playwright 内置浏览器")
 
-    page = await context.new_page()
-    return pw, browser, context, page
+    context = await pw.chromium.launch_persistent_context(**launch_args)
+
+    # 注入 stealth 脚本（隐藏 navigator.webdriver 等自动化特征）
+    page = context.pages[0] if context.pages else await context.new_page()
+    await _stealth.apply_stealth_async(page)
+    print("[浏览器] stealth 插件已注入")
+
+    # cookie 注入：如果旧 session 文件存在，补充注入 cookie
+    if SESSION_FILE.exists():
+        try:
+            state = json.loads(SESSION_FILE.read_text())
+            cookies = state.get("cookies", [])
+            if cookies:
+                await context.add_cookies(cookies)
+                print(f"[浏览器] 已注入 {len(cookies)} 条 cookie")
+        except Exception as e:
+            print(f"[浏览器] cookie 注入失败: {e}")
+
+    # launch_persistent_context 没有独立的 browser 对象
+    # 返回 None 作为 browser 占位，关闭时用 context.close()
+    return pw, None, context, page
 
 
 async def check_login(page):
     """检查是否已登录淘宝。"""
     await page.goto("https://www.taobao.com/", wait_until="domcontentloaded")
-    await page.wait_for_timeout(2000)
+    await _human_delay(2, 3)
 
-    # 检查页面上是否有登录入口（未登录时会显示"请登录"）
     login_link = await page.query_selector('a[href*="login.taobao.com"]')
     if login_link:
         text = await login_link.inner_text()
@@ -63,59 +131,47 @@ async def wait_for_manual_login(page, timeout=120):
 
 
 async def save_session(context):
-    """保存当前 session 到文件。"""
+    """保存当前 cookie 到文件（供后续 cookie 注入使用）。
+
+    注意：launch_persistent_context 会自动持久化 user-data-dir，
+    这里额外保存 cookie 作为备份和跨 profile 迁移用。
+    """
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
-    await context.storage_state(path=str(SESSION_FILE))
-    print("[Session] 已保存")
+    cookies = await context.cookies()
+    state = {"cookies": cookies}
+    SESSION_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+    print(f"[Session] 已保存 {len(cookies)} 条 cookie")
 
 
 async def search_products(page, keyword):
-    """在淘宝搜索关键词，等待商品列表加载。
-
-    关键：通过首页搜索框交互而非直接 URL 跳转，避免触发淘宝反爬虫机制。
-    """
+    """在淘宝搜索关键词，等待商品列表加载。"""
     print(f"[搜索] 关键词: {keyword}")
 
-    # 导航到淘宝首页
     print(f"[搜索] 导航到淘宝首页...")
     await page.goto("https://www.taobao.com/", wait_until="domcontentloaded")
-    await page.wait_for_timeout(2000)
+    await _human_delay(2, 4)
 
     # 定位搜索框
     print(f"[搜索] 定位搜索框...")
     search_input = None
-    search_selectors = [
-        'input#q',
-        'input[id="q"]',
-        'input[placeholder*="搜索"]',
-        'input[name="q"]',
-    ]
-
-    for sel in search_selectors:
-        try:
-            search_input = await page.query_selector(sel)
-            if search_input:
-                print(f"[搜索] 找到搜索框: {sel}")
-                break
-        except:
-            pass
+    for sel in ['input#q', 'input[name="q"]', 'input[placeholder*="搜索"]']:
+        search_input = await page.query_selector(sel)
+        if search_input:
+            print(f"[搜索] 找到搜索框: {sel}")
+            break
 
     if not search_input:
-        print(f"[搜索] 未找到搜索框，尝试等待...")
         search_input = await page.wait_for_selector('input[type="text"], input[type="search"]', timeout=10000)
 
-    # 填充搜索框
-    print(f"[搜索] 填充关键词: {keyword}")
+    # 模拟人类输入：点击 → 短暂停顿 → 逐字输入
     await search_input.click()
-    await page.wait_for_timeout(500)
+    await _human_delay(0.3, 0.8)
     await search_input.evaluate("el => el.value = ''")
-    await search_input.fill(keyword)
-    await page.wait_for_timeout(500)
+    await page.keyboard.type(keyword, delay=random.randint(80, 200))
+    await _human_delay(0.5, 1.0)
 
     # 按回车触发搜索
     print(f"[搜索] 发送回车键...")
-
-    # 监听导航（等待 URL 变化）
     try:
         await asyncio.gather(
             search_input.press('Enter'),
@@ -125,29 +181,21 @@ async def search_products(page, keyword):
     except Exception as e:
         print(f"[搜索] 导航异常: {e}")
 
-    # 等待一下，让页面完全渲染
-    await page.wait_for_timeout(3000)
+    await _human_delay(2, 4)
+
     current_url = page.url
-    print(f"[诊断] 导航后 URL: {current_url}")
+    print(f"[诊断] 当前 URL: {current_url}")
 
     # 等待网络空闲
-    print(f"[搜索] 等待页面完全加载...")
     try:
         await page.wait_for_load_state('networkidle', timeout=20000)
     except:
-        print(f"[搜索] 网络空闲等待超时，继续处理...")
+        pass
 
-    # 最后的稳定等待
-    await page.wait_for_timeout(2000)
-
-    # 诊断
-    current_url = page.url
-    print(f"[诊断] 最终 URL: {current_url}")
+    await _human_delay(1, 2)
 
     if 'error' in current_url:
         print(f"[错误] 淘宝返回错误页面，可能被反爬虫拦截")
-        print(f"[建议] 请检查会话是否过期，或尝试手动登录")
-        # 继续执行，让后续流程处理
     else:
         print(f"[搜索] ✓ 搜索完成")
 
@@ -156,69 +204,62 @@ async def scrape_product_list(page):
     """从搜索结果页抓取商品基本信息。"""
     items = []
 
-    # 滚动页面触发懒加载
+    # 模拟人类滚动浏览：随机滚动距离 + 随机间隔
     for i in range(5):
-        await page.evaluate("window.scrollBy(0, 600)")
-        await page.wait_for_timeout(800)
+        scroll_dist = random.randint(400, 800)
+        await page.evaluate(f"window.scrollBy(0, {scroll_dist})")
+        await _human_delay(0.8, 2.0)
         print(f"[抓取] 滚动 {i+1}/5")
 
-    # 关键：直接用 XPath 或链接查找商品
-    # 淘宝商品链接通常是 a 标签，href 包含 item.taobao.com 或 detail.tmall.com
+    # 查找商品链接
     print(f"[抓取] 查找商品链接...")
     links = await page.query_selector_all('a[href*="item.taobao.com"], a[href*="detail.tmall.com"]')
     print(f"[抓取] 找到 {len(links)} 个商品链接")
 
     if not links:
-        print(f"[诊断] 未找到商品链接，尝试备选方案...")
-        # 备选：查找所有可能的商品容器
         divs = await page.query_selector_all('div[class*="card"], div[class*="item"], div[class*="product"]')
         print(f"[诊断] 找到 {len(divs)} 个可能的卡片容器")
         return items
 
-    # 从链接元素中提取商品信息
-    for link in links[:10]:  # 限制处理前 10 个
+    for link in links[:10]:
         try:
             href = await link.get_attribute("href")
             if not href:
                 continue
 
-            # 提取商品标题
             title = await link.inner_text()
             title = title.strip()
             if not title or len(title) < 2:
                 continue
 
-            # 构建绝对 URL
             if href.startswith('//'):
                 href = 'https:' + href
             elif href.startswith('/'):
                 href = 'https://taobao.com' + href
 
-            # 尝试找价格和店铺信息（这些通常在链接的兄弟或父元素中）
-            parent = await link.evaluate_handle("el => el.closest('[class*=\"card\"], [class*=\"item\"], [class*=\"product\"], .tbp-item, .shop-item')")
-            if parent:
-                try:
-                    # 查找价格
-                    price_el = await parent.evaluate("el => el.querySelector('[class*=\"price\"], [class*=\"Price\"]')")
+            # 尝试从父容器提取价格
+            price = '0'
+            try:
+                parent = await link.evaluate_handle(
+                    "el => el.closest('[class*=\"card\"], [class*=\"item\"], [class*=\"product\"]')"
+                )
+                if parent:
+                    price_el = await parent.evaluate(
+                        "el => { const p = el.querySelector('[class*=\"price\"], [class*=\"Price\"]'); return p ? p.textContent : null; }"
+                    )
                     if price_el:
-                        price_text = await price_el.inner_text()
-                        price = price_text.replace('¥', '').strip()
-                    else:
-                        price = '0'
-                except:
-                    price = '0'
-            else:
-                price = '0'
+                        price = price_el.replace('¥', '').strip()
+            except:
+                pass
 
-            item = {
+            items.append({
                 "title": title,
                 "price": price,
                 "sales": "",
                 "shop": "",
                 "url": href,
                 "rating": None,
-            }
-            items.append(item)
+            })
             print(f"[抓取] ✓ {title[:30]}... ¥{price}")
         except Exception as e:
             print(f"[抓取] 单个商品解析失败: {e}")
@@ -227,64 +268,14 @@ async def scrape_product_list(page):
     print(f"[抓取] 成功抓取 {len(items)} 个商品")
     return items
 
-    for card in cards:
-        try:
-            item = await _extract_card_info(card)
-            if item:
-                items.append(item)
-        except Exception as e:
-            print(f"[抓取] 单个商品解析失败: {e}")
-            continue
-
-    return items
-
-
-async def _extract_card_info(card):
-    """从单个商品卡片中提取信息。"""
-    # 商品名称 — 用属性前缀匹配，兼容哈希变化
-    title_el = await card.query_selector('[class*="title--"], [class*="Title--title"], .title')
-    if not title_el:
-        title_el = await card.query_selector('a[href*="detail.tmall"], a[href*="item.taobao"]')
-    title = await title_el.inner_text() if title_el else ""
-    title = title.strip()
-    if not title:
-        return None
-
-    # 价格
-    price_el = await card.query_selector('[class*="priceInt"], [class*="Price--price"], .price')
-    price_text = await price_el.inner_text() if price_el else "0"
-    price = price_text.strip().replace("¥", "").replace(",", "")
-
-    # 销量
-    sales_el = await card.query_selector('[class*="realSales"], [class*="Sales--"], .deal-cnt')
-    sales_text = await sales_el.inner_text() if sales_el else ""
-
-    # 店铺名
-    shop_el = await card.query_selector('[class*="ShopInfo"], [class*="shopName"], .shop, .shopname')
-    shop = await shop_el.inner_text() if shop_el else ""
-
-    # 商品链接
-    link_el = await card.query_selector('a[href*="detail"], a[href*="item"]')
-    link = await link_el.get_attribute("href") if link_el else ""
-    if link and link.startswith("//"):
-        link = "https:" + link
-
-    return {
-        "title": title,
-        "price": price,
-        "sales": sales_text.strip(),
-        "shop": shop.strip(),
-        "url": link,
-        "rating": None,
-    }
-
 
 async def fetch_rating(page, product_url):
     """进入商品详情页获取好评率。"""
     try:
         detail_page = await page.context.new_page()
+        await _stealth.apply_stealth_async(detail_page)
         await detail_page.goto(product_url, wait_until="domcontentloaded", timeout=15000)
-        await detail_page.wait_for_timeout(2000)
+        await _human_delay(2, 3)
 
         # 尝试多种选择器定位好评率
         rating_selectors = [
@@ -358,9 +349,8 @@ async def add_to_cart(page, product_url):
     """进入商品详情页，点击加入购物车。"""
     try:
         await page.goto(product_url, wait_until="domcontentloaded", timeout=15000)
-        await page.wait_for_timeout(2000)
+        await _human_delay(2, 3)
 
-        # 尝试多种加购按钮选择器
         cart_selectors = [
             '#J_LinkBasket',
             'button:has-text("加入购物车")',
@@ -373,8 +363,9 @@ async def add_to_cart(page, product_url):
         for sel in cart_selectors:
             btn = await page.query_selector(sel)
             if btn:
+                await _human_delay(0.3, 0.8)
                 await btn.click()
-                await page.wait_for_timeout(2000)
+                await _human_delay(1.5, 2.5)
                 print(f"[加购] 成功")
                 return True
 
@@ -434,5 +425,6 @@ async def run_task(keyword, rating_threshold=99, max_results=5):
         print(f"[任务异常] {e}")
         return {"status": "failed", "message": str(e)}
     finally:
-        await browser.close()
+        # launch_persistent_context 没有独立 browser 对象，直接关闭 context
+        await context.close()
         await pw.stop()
